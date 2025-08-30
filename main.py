@@ -5,13 +5,14 @@ import subprocess
 import sys
 import time
 import toml
+from typing import List
 import numpy as np
 from pathlib import Path
 import onnxruntime # workaround: Pre-import to avoid ImportError: DLL load failed while importing onnxruntime_pybind11_state: 动态链接库(DLL)初始化例程失败。
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QPushButton, QLineEdit, QCheckBox, QComboBox,
-                             QGroupBox, QScrollArea, QMessageBox, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect,
-                             QFrame)
+from PyQt6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,
+                             QListWidget,QLabel,QPushButton,QLineEdit,QCheckBox,QComboBox,
+                             QGroupBox,QScrollArea,QMessageBox,QGridLayout,QSizePolicy,QGraphicsDropShadowEffect,
+                             QFrame,QDialog)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QPixmap, QImage, QFont, QIcon, QPainter, QColor
 import PyQt6.QtCore as QtCore
@@ -23,6 +24,9 @@ import recognize
 from recognize import MONSTER_COUNT
 from specialmonster import SpecialMonsterHandler
 import data_package
+
+import ctypes
+from ctypes import wintypes
 
 logging.getLogger().setLevel(logging.DEBUG)
 logging.getLogger("PIL").setLevel(logging.INFO)
@@ -102,6 +106,31 @@ class AsyncHistoryMatch(QObject):
         if self._match is None:
             raise AttributeError(f"HistoryMatch not loaded yet: '{name}'")
         return getattr(self._match, name)
+
+
+def list_visible_window_titles() -> list[str]:
+    """列出所有**可见**窗口的标题（去重并按字典序排序）。"""
+    EnumWindows = ctypes.windll.user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+    GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+    GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
+
+    titles: List[str] = []
+
+    def foreach(hwnd, lParam):
+        if IsWindowVisible(hwnd):
+            length = GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buff = ctypes.create_unicode_buffer(length + 1)
+                GetWindowTextW(hwnd, buff, length + 1)
+                t = buff.value.strip()
+                if t:
+                    titles.append(t)
+        return True
+
+    EnumWindows(EnumWindowsProc(foreach), 0)
+    return sorted(set(titles))
 
 
 class ArknightsApp(QMainWindow):
@@ -278,7 +307,7 @@ class ArknightsApp(QMainWindow):
         self.scroll_grid.setSpacing(5)
         self.scroll_grid.setContentsMargins(5, 5, 5, 5)
 
-        # 设置5列布局
+        # 设置7列布局
         self.COLUMNS = 7
         self.ROW_HEIGHT = 120  # 每个单元的高度
 
@@ -478,6 +507,8 @@ class ArknightsApp(QMainWindow):
 
         self.reselect_button = QPushButton("选择范围")
         self.reselect_button.clicked.connect(self.reselect_roi)
+        self.choose_window_button = QPushButton("选择截屏窗口")
+        self.choose_window_button.clicked.connect(self.choose_capture_window)
 
         self.serial_label = QLabel("模拟器序列号:")
         self.serial_entry = QLineEdit()
@@ -487,6 +518,7 @@ class ArknightsApp(QMainWindow):
         self.serial_button = QPushButton("更新")
         self.serial_button.clicked.connect(self.update_device_serial)
 
+        row3_layout.addWidget(self.choose_window_button)
         row3_layout.addWidget(self.reselect_button)
         row3_layout.addWidget(self.serial_label)
         row3_layout.addWidget(self.serial_entry)
@@ -601,6 +633,108 @@ class ArknightsApp(QMainWindow):
         self.N_history = history_match.N_history
         self.history_data_loaded = True
         logger.info("错题本加载成功")
+
+    # ------------------------- 截屏源选择对话框 -------------------------
+    class WindowPickerDialog(QDialog):
+        """列出可见窗口标题，并内置“整屏(1/2/3)”选项。双击确定。"""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("选择截屏窗口")
+            self.resize(520, 480)
+            self.selected_title = None
+
+            self.search = QLineEdit(self)
+            self.search.setPlaceholderText("输入关键字过滤（支持大小写不敏感）")
+
+            self.listw = QListWidget(self)
+            # 预置“整屏（主屏0/副屏1/2）”选项在最上面
+            self.listw.addItem("【整屏】主屏(1)")
+            self.listw.addItem("【整屏】副屏(2)")
+            self.listw.addItem("【整屏】副屏(3)")
+            self.listw.addItem("—————— 窗口列表 ——————")
+
+            self._all_titles = list_visible_window_titles()
+            for t in self._all_titles:
+                self.listw.addItem(t)
+
+            self.search.textChanged.connect(self._filter)
+            self.listw.itemDoubleClicked.connect(self._accept)
+
+            layout = QVBoxLayout(self)
+            layout.addWidget(self.search)
+            layout.addWidget(self.listw)
+
+        def _filter(self, text: str):
+            text_low = (text or "").lower()
+            self.listw.clear()
+            self.listw.addItem("【整屏】主屏(1)")
+            self.listw.addItem("【整屏】副屏(2)")
+            self.listw.addItem("【整屏】副屏(3)")
+            self.listw.addItem("—————— 窗口列表 ——————")
+            for t in self._all_titles:
+                if text_low in t.lower():
+                    self.listw.addItem(t)
+
+        def _accept(self):
+            self.accept()
+
+        def get_selection(self):
+            item = self.listw.currentItem()
+            if not item:
+                return None
+            text = item.text()
+            if text.startswith("【整屏】"):
+                # 返回 monitor_index
+                if "(1)" in text:
+                    return {"monitor_index": 1}
+                if "(2)" in text:
+                    return {"monitor_index": 2}
+                if "(3)" in text:
+                    return {"monitor_index": 3}
+            elif text.startswith("——————"):
+                return None
+            else:
+                # 返回 window_name
+                return {"window_name": text}
+
+    # ------------------------------ 功能操作 ------------------------------
+    def choose_capture_window(self):
+        """弹出窗口选择器，切换 WinRT 截屏源（窗口标题或整屏）。"""
+        import traceback, cv2
+        if getattr(self, "_switching_source", False):
+            return
+        self._switching_source = True
+        self.choose_window_button.setEnabled(False)
+        try:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            dlg = self.WindowPickerDialog(self)
+            if dlg.exec():
+                sel = dlg.get_selection()
+                if not sel:
+                    QMessageBox.information(self, "提示", "未选择任何项")
+                    return
+                ok = False
+                if "window_name" in sel:
+                    ok = self.recognizer.update_capture_target(window_name=sel["window_name"], monitor_index=None)
+                    hint = f"已切换至窗口：{sel['window_name']}"
+                else:
+                    idx = max(1, sel["monitor_index"])
+                    ok = self.recognizer.update_capture_target(window_name=None, monitor_index=idx)
+                    hint = f"已切换至整屏：显示器 {sel['monitor_index']}"
+                if ok:
+                    self.no_region = True
+                    QMessageBox.information(self, "成功", hint + "\n建议重新选择范围。")
+                else:
+                    QMessageBox.critical(self, "失败", "切换截屏目标失败，请重试。")
+        except Exception as e:
+            QMessageBox.critical(self, "异常", f"{e}\n\n{traceback.format_exc()}")
+        finally:
+            self._switching_source = False
+            self.choose_window_button.setEnabled(True)
 
     def paintEvent(self, event):
         painter = QPainter(self)
